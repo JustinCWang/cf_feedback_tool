@@ -9,6 +9,7 @@ import { loadDataset, type DatasetKind } from "../lib/mock-data";
 
 export function IngestPage() {
 	const [busy, setBusy] = useState(false);
+	const [activeDataset, setActiveDataset] = useState<DatasetKind | null>(null);
 	const [analyzing, setAnalyzing] = useState(false);
 	const [status, setStatus] = useState("");
 	const [preview, setPreview] = useState<Array<
@@ -17,6 +18,7 @@ export function IngestPage() {
 
 	async function handleDatasetRun(kind: DatasetKind) {
 		setBusy(true);
+		setActiveDataset(kind);
 		setStatus("");
 		try {
 			const items = await loadDataset(kind);
@@ -29,6 +31,7 @@ export function IngestPage() {
 		} catch (error) {
 			setStatus(error instanceof Error ? error.message : "Ingest failed.");
 		} finally {
+			setActiveDataset(null);
 			setBusy(false);
 		}
 	}
@@ -67,7 +70,11 @@ export function IngestPage() {
 					title="Dataset controls"
 					description="Use staged data to tell a story with baseline, spike, and follow-up waves."
 				>
-					<DatasetActions busy={busy} onRun={handleDatasetRun} />
+					<DatasetActions
+						busy={busy}
+						activeKind={activeDataset}
+						onRun={handleDatasetRun}
+					/>
 					{status ? <p className="inline-status">{status}</p> : null}
 				</SectionCard>
 

@@ -19,6 +19,7 @@ export function InboxPage() {
 	const [data, setData] = useState<ItemsResponse | null>(null);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState("");
+	const pageSize = 12;
 
 	const filters = {
 		source: searchParams.get("source") ?? "",
@@ -37,7 +38,7 @@ export function InboxPage() {
 			setError("");
 			try {
 				const result = await getItems({
-					limit: 12,
+					limit: pageSize,
 					offset,
 					source: filters.source || undefined,
 					product_area: filters.product_area || undefined,
@@ -63,7 +64,7 @@ export function InboxPage() {
 		return () => {
 			cancelled = true;
 		};
-	}, [filters.account_tier, filters.from, filters.product_area, filters.source, filters.to, offset]);
+	}, [filters.account_tier, filters.from, filters.product_area, filters.source, filters.to, offset, pageSize]);
 
 	return (
 		<div className="page-stack">
@@ -94,13 +95,18 @@ export function InboxPage() {
 				description="Server-backed records ordered by newest feedback first."
 				actions={
 					<div className="pagination">
+						<span className="pagination__summary">
+							{loading
+								? "Loading pages..."
+								: `Page ${data?.current_page ?? 0} of ${data?.total_pages ?? 0}`}
+						</span>
 						<button
 							type="button"
 							className="button-secondary"
 							disabled={offset === 0}
 							onClick={() => {
 								const next = new URLSearchParams(searchParams);
-								const nextOffset = Math.max(0, offset - 12);
+								const nextOffset = Math.max(0, offset - pageSize);
 								if (nextOffset === 0) {
 									next.delete("offset");
 								} else {
@@ -134,7 +140,13 @@ export function InboxPage() {
 				) : error ? (
 					<p className="error-text">{error}</p>
 				) : (
-					<FeedbackTable items={data?.items ?? []} />
+					<>
+						<p className="muted-text">
+							Showing {data?.items.length ?? 0} of {data?.total_count ?? 0} matching
+							items.
+						</p>
+						<FeedbackTable items={data?.items ?? []} />
+					</>
 				)}
 			</SectionCard>
 		</div>

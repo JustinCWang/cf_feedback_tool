@@ -33,6 +33,10 @@ type TotalsRow = {
 	latest_ingested_at: string | null;
 };
 
+type TotalCountRow = {
+	total_count: number | string;
+};
+
 type ThemeTimelineRow = {
 	bucket: string;
 	waf_false_positive: number | string;
@@ -964,27 +968,39 @@ app.get("/api/items", async (c) => {
 			.join(" ") + ";";
 
 	try {
-		const results = await c.env.DB.prepare(sql)
-			.bind(...binds, limit, offset)
-			.all<{
-				id: string;
-				source: FeedbackSource;
-				source_ref: string | null;
-				url: string | null;
-				author: string | null;
-				account_tier: AccountTier | null;
-				product_area: ProductArea | null;
-				created_at: string;
-				ingested_at: string;
-				location_region: Region | null;
-				location_country: string | null;
-				location_colo: string | null;
-				text: string;
-				sentiment: Sentiment | null;
-				urgency: Urgency | null;
-				processed_at: string | null;
-				metadata_json: string | null;
-			}>();
+		const countSql =
+			[
+				"SELECT COUNT(*) AS total_count",
+				"FROM feedback_items",
+				where.length ? `WHERE ${where.join(" AND ")}` : "",
+			]
+				.filter(Boolean)
+				.join(" ") + ";";
+
+		const [results, totalRow] = await Promise.all([
+			c.env.DB.prepare(sql)
+				.bind(...binds, limit, offset)
+				.all<{
+					id: string;
+					source: FeedbackSource;
+					source_ref: string | null;
+					url: string | null;
+					author: string | null;
+					account_tier: AccountTier | null;
+					product_area: ProductArea | null;
+					created_at: string;
+					ingested_at: string;
+					location_region: Region | null;
+					location_country: string | null;
+					location_colo: string | null;
+					text: string;
+					sentiment: Sentiment | null;
+					urgency: Urgency | null;
+					processed_at: string | null;
+					metadata_json: string | null;
+				}>(),
+			c.env.DB.prepare(countSql).bind(...binds).first<TotalCountRow>(),
+		]);
 
 		const items = (results.results ?? []).map((r) => {
 			const metadata = parseMetadataJson(r.metadata_json);
@@ -1012,7 +1028,17 @@ app.get("/api/items", async (c) => {
 		});
 
 		const next_offset = items.length === limit ? offset + limit : null;
-		return c.json({ items, next_offset });
+		const totalCount = toCount(totalRow?.total_count);
+		const totalPages = totalCount === 0 ? 0 : Math.ceil(totalCount / limit);
+		const currentPage = totalCount === 0 ? 0 : Math.floor(offset / limit) + 1;
+		return c.json({
+			items,
+			next_offset,
+			total_count: totalCount,
+			page_size: limit,
+			current_page: currentPage,
+			total_pages: totalPages,
+		});
 	} catch (err) {
 		console.error("items query failed:", err);
 		return jsonError("Failed to fetch items.", 500, "internal_error");

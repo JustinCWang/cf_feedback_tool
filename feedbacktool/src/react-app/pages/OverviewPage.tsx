@@ -12,6 +12,7 @@ export function OverviewPage() {
 	const [data, setData] = useState<OverviewResponse | null>(null);
 	const [loading, setLoading] = useState(true);
 	const [busy, setBusy] = useState(false);
+	const [activeDataset, setActiveDataset] = useState<DatasetKind | null>(null);
 	const [status, setStatus] = useState("");
 
 	async function refreshOverview() {
@@ -29,6 +30,7 @@ export function OverviewPage() {
 
 	async function handleDatasetRun(kind: DatasetKind) {
 		setBusy(true);
+		setActiveDataset(kind);
 		setStatus("");
 		try {
 			const items = await loadDataset(kind);
@@ -40,6 +42,7 @@ export function OverviewPage() {
 		} catch (error) {
 			setStatus(error instanceof Error ? error.message : "Ingest failed.");
 		} finally {
+			setActiveDataset(null);
 			setBusy(false);
 		}
 	}
@@ -87,7 +90,12 @@ export function OverviewPage() {
 							title="Quick ingest actions"
 							description="Seed the baseline story, the incident spike, or the full storyline directly into D1."
 						>
-							<DatasetActions busy={busy} onRun={handleDatasetRun} compact />
+							<DatasetActions
+								busy={busy}
+								activeKind={activeDataset}
+								onRun={handleDatasetRun}
+								compact
+							/>
 							{status ? <p className="inline-status">{status}</p> : null}
 						</SectionCard>
 

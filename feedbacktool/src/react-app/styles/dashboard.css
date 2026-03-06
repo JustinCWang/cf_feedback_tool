@@ -248,6 +248,9 @@
 }
 
 .dataset-action__title {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.45rem;
 	font-weight: 650;
 }
 
@@ -455,6 +458,17 @@
 .pagination {
 	display: flex;
 	gap: 0.65rem;
+}
+
+.pagination {
+	align-items: center;
+	flex-wrap: wrap;
+}
+
+.pagination__summary {
+	color: var(--text-soft);
+	font-size: 0.92rem;
+	margin-right: 0.25rem;
 }
 
 .bar-list {

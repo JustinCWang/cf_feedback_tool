@@ -27,6 +27,10 @@ export type AnalyzeResponse = {
 export type ItemsResponse = {
 	items: Array<FeedbackItem & { ingested_at: string }>;
 	next_offset: number | null;
+	total_count: number;
+	page_size: number;
+	current_page: number;
+	total_pages: number;
 };
 
 export type BreakdownDatum = {
