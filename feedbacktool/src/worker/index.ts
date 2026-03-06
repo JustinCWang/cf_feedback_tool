@@ -5,9 +5,15 @@ import type {
 	FeedbackSource,
 	ProductArea,
 	Region,
+	Sentiment,
+	Urgency,
 } from "../shared/types";
 
-const app = new Hono<{ Bindings: Env }>();
+type WorkerBindings = Env & {
+	AI: Ai<Record<string, BaseAiTextGeneration>>;
+};
+
+const app = new Hono<{ Bindings: WorkerBindings }>();
 
 type HealthCheckRow = {
 	ok: number;
@@ -34,6 +40,47 @@ type ThemeTimelineRow = {
 	analytics_delay: number | string;
 };
 
+type AnalyzeTargetRow = {
+	id: string;
+	text: string;
+	metadata_json: string | null;
+};
+
+type AnalyzeRequest = {
+	scope?: "unprocessed";
+	steps?: {
+		classify?: boolean;
+	};
+	limits?: {
+		max_items?: number;
+	};
+};
+
+type ThemeFamily =
+	| "Auth"
+	| "Billing"
+	| "Docs"
+	| "Performance"
+	| "Deploy"
+	| "Analytics"
+	| "Permissions"
+	| "UX"
+	| "Bug"
+	| "FeatureRequest";
+
+type ClassificationResult = {
+	sentiment: Sentiment;
+	urgency: Urgency;
+	theme_family: ThemeFamily;
+	theme_label: string;
+	confidence: number;
+	rationale: string;
+	model: string;
+	verifier_used: boolean;
+};
+
+type ModelClassification = Omit<ClassificationResult, "model" | "verifier_used">;
+
 function jsonError(
 	message: string,
 	status: number,
@@ -54,6 +101,195 @@ function parseIntParam(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseMetadataJson(value: string | null | undefined): Record<string, unknown> {
+	if (!value) return {};
+	try {
+		const parsed = JSON.parse(value) as unknown;
+		return isRecord(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+function hasKeyword(text: string, keywords: readonly string[]): boolean {
+	const normalized = text.toLowerCase();
+	return keywords.some((keyword) => normalized.includes(keyword));
+}
+
+function wordCount(text: string): number {
+	return text
+		.trim()
+		.split(/\s+/)
+		.filter(Boolean).length;
+}
+
+function isValidSentiment(value: unknown): value is Sentiment {
+	return typeof value === "string" && SENTIMENTS.includes(value as Sentiment);
+}
+
+function isValidUrgency(value: unknown): value is Urgency {
+	return typeof value === "string" && URGENCY_LEVELS.includes(value as Urgency);
+}
+
+function isValidThemeFamily(value: unknown): value is ThemeFamily {
+	return typeof value === "string" && THEME_FAMILIES.includes(value as ThemeFamily);
+}
+
+function validateModelClassification(
+	value: unknown,
+): { ok: true; value: ModelClassification } | { ok: false; reason: string } {
+	if (!isRecord(value)) {
+		return { ok: false, reason: "Model output was not a JSON object." };
+	}
+
+	const sentiment = value.sentiment;
+	const urgency = value.urgency;
+	const themeFamily = value.theme_family;
+	const themeLabel = value.theme_label;
+	const confidence = value.confidence;
+	const rationale = value.rationale;
+
+	if (!isValidSentiment(sentiment)) {
+		return { ok: false, reason: "Invalid sentiment returned by model." };
+	}
+	if (!isValidUrgency(urgency)) {
+		return { ok: false, reason: "Invalid urgency returned by model." };
+	}
+	if (!isValidThemeFamily(themeFamily)) {
+		return { ok: false, reason: "Invalid theme_family returned by model." };
+	}
+	if (typeof themeLabel !== "string" || themeLabel.trim() === "") {
+		return { ok: false, reason: "theme_label must be a non-empty string." };
+	}
+	if (wordCount(themeLabel) > 6) {
+		return { ok: false, reason: "theme_label exceeded six words." };
+	}
+	if (typeof confidence !== "number" || confidence < 0 || confidence > 1) {
+		return { ok: false, reason: "confidence must be between 0 and 1." };
+	}
+	if (typeof rationale !== "string" || rationale.trim() === "") {
+		return { ok: false, reason: "rationale must be a short string." };
+	}
+
+	return {
+		ok: true,
+		value: {
+			sentiment,
+			urgency,
+			theme_family: themeFamily,
+			theme_label: themeLabel.trim(),
+			confidence,
+			rationale: rationale.trim(),
+		},
+	};
+}
+
+function parseAiJsonResponse(payload: AiTextGenerationOutput): unknown {
+	const raw = payload.response;
+	if (typeof raw !== "string") return raw;
+	try {
+		return JSON.parse(raw) as unknown;
+	} catch {
+		return raw;
+	}
+}
+
+function violatesUrgencyGuardrails(
+	text: string,
+	classification: ModelClassification,
+): boolean {
+	const highUrgencySignal = hasKeyword(text, HIGH_URGENCY_KEYWORDS);
+	if (highUrgencySignal && classification.urgency === "low") {
+		return true;
+	}
+
+	const praiseOnlyOrFeatureRequest =
+		hasKeyword(text, NON_BLOCKING_SIGNALS) && !hasKeyword(text, BLOCKER_SIGNALS);
+	if (praiseOnlyOrFeatureRequest && classification.urgency === "high") {
+		return true;
+	}
+
+	return false;
+}
+
+async function runClassificationModel(
+	env: WorkerBindings,
+	model: string,
+	text: string,
+): Promise<ModelClassification> {
+	const response = await env.AI.run(model, {
+		messages: [
+			{
+				role: "system",
+				content: [
+					"You classify product feedback into strict JSON.",
+					"Return only fields required by the schema.",
+					"Use one theme_family from the allowed list.",
+					"Keep theme_label concise, concrete, and at most 6 words.",
+					"Urgency should reflect operational impact, not just negative tone.",
+					"Rationale must be one short sentence.",
+				].join(" "),
+			},
+			{
+				role: "user",
+				content: [
+					"Classify this feedback item.",
+					"",
+					`Feedback text: """${text}"""`,
+					"",
+					"Urgency guardrails:",
+					"- If the text mentions outage, blocker, security, billing charge, or similar harm, urgency cannot be low.",
+					"- If the text is praise-only or a feature request with no blocker language, urgency cannot be high.",
+				].join("\n"),
+			},
+		],
+		response_format: {
+			type: "json_schema",
+			json_schema: CLASSIFICATION_SCHEMA,
+		},
+		max_tokens: 220,
+		temperature: 0.2,
+	});
+
+	const validation = validateModelClassification(parseAiJsonResponse(response));
+	if (!validation.ok) {
+		throw new Error(validation.reason);
+	}
+
+	return validation.value;
+}
+
+async function classifyWithVerifierFallback(
+	env: WorkerBindings,
+	text: string,
+): Promise<ClassificationResult> {
+	let verifierUsed = false;
+	let selectedModel = PRIMARY_MODEL;
+
+	try {
+		const primary = await runClassificationModel(env, PRIMARY_MODEL, text);
+		if (!violatesUrgencyGuardrails(text, primary) && primary.confidence >= 0.6) {
+			return {
+				...primary,
+				model: PRIMARY_MODEL,
+				verifier_used: false,
+			};
+		}
+	} catch {
+		// Fall through to verifier. JSON Mode can fail when the schema cannot be met.
+	}
+
+	verifierUsed = true;
+	selectedModel = VERIFIER_MODEL;
+	const verifier = await runClassificationModel(env, VERIFIER_MODEL, text);
+
+	return {
+		...verifier,
+		model: selectedModel,
+		verifier_used: verifierUsed,
+	};
 }
 
 async function sha256Hex(input: string): Promise<string> {
@@ -111,6 +347,108 @@ const PRODUCT_AREAS: ReadonlySet<ProductArea> = new Set([
 ]);
 
 const REGIONS: ReadonlySet<Region> = new Set(["NA", "EU", "APAC", "LATAM"]);
+
+const PRIMARY_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+const VERIFIER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+const SENTIMENTS: readonly Sentiment[] = ["positive", "neutral", "negative"];
+const URGENCY_LEVELS: readonly Urgency[] = ["low", "medium", "high"];
+const THEME_FAMILIES: readonly ThemeFamily[] = [
+	"Auth",
+	"Billing",
+	"Docs",
+	"Performance",
+	"Deploy",
+	"Analytics",
+	"Permissions",
+	"UX",
+	"Bug",
+	"FeatureRequest",
+];
+
+const HIGH_URGENCY_KEYWORDS = [
+	"outage",
+	"down",
+	"blocker",
+	"blocked",
+	"blocking",
+	"security",
+	"breach",
+	"charge",
+	"charged",
+	"invoice",
+	"billing",
+	"refund",
+	"fraud",
+];
+
+const NON_BLOCKING_SIGNALS = [
+	"love",
+	"great",
+	"nice",
+	"thanks",
+	"thank you",
+	"feature request",
+	"would love",
+	"please add",
+	"please support",
+	"wish",
+];
+
+const BLOCKER_SIGNALS = [
+	"broken",
+	"failing",
+	"failure",
+	"can't",
+	"cannot",
+	"unable",
+	"issue",
+	"incident",
+	"error",
+	"blocked",
+	"outage",
+	"loop",
+	"403",
+	"500",
+];
+
+const CLASSIFICATION_SCHEMA = {
+	type: "object",
+	properties: {
+		sentiment: {
+			type: "string",
+			enum: [...SENTIMENTS],
+		},
+		urgency: {
+			type: "string",
+			enum: [...URGENCY_LEVELS],
+		},
+		theme_family: {
+			type: "string",
+			enum: [...THEME_FAMILIES],
+		},
+		theme_label: {
+			type: "string",
+		},
+		confidence: {
+			type: "number",
+			minimum: 0,
+			maximum: 1,
+		},
+		rationale: {
+			type: "string",
+		},
+	},
+	required: [
+		"sentiment",
+		"urgency",
+		"theme_family",
+		"theme_label",
+		"confidence",
+		"rationale",
+	],
+	additionalProperties: false,
+} as const;
 
 app.get("/api", (c) =>
 	c.json({
@@ -326,6 +664,103 @@ app.get("/api/trends", async (c) => {
 	}
 });
 
+app.post("/api/analyze", async (c) => {
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		return jsonError("Invalid JSON body.", 400);
+	}
+
+	const request = (isRecord(body) ? body : {}) as AnalyzeRequest;
+	const scope = request.scope ?? "unprocessed";
+	const classify = request.steps?.classify ?? false;
+	const maxItems = parseIntParam(String(request.limits?.max_items ?? ""), {
+		fallback: 100,
+		min: 1,
+		max: 100,
+	});
+
+	if (scope !== "unprocessed") {
+		return jsonError("Only scope=unprocessed is supported right now.", 400);
+	}
+	if (!classify) {
+		return jsonError("This endpoint currently supports steps.classify=true only.", 400);
+	}
+
+	let targets: AnalyzeTargetRow[] = [];
+	try {
+		const result = await c.env.DB.prepare(
+			[
+				"SELECT id, text, metadata_json",
+				"FROM feedback_items",
+				"WHERE sentiment IS NULL OR urgency IS NULL",
+				"ORDER BY created_at DESC",
+				"LIMIT ?",
+			].join(" "),
+		)
+			.bind(maxItems)
+			.all<AnalyzeTargetRow>();
+		targets = result.results ?? [];
+	} catch (error) {
+		console.error("analyze target query failed:", error);
+		return jsonError("Failed to load items for analysis.", 500, "internal_error");
+	}
+
+	if (targets.length === 0) {
+		return c.json({ processed: 0, classified: 0, verifier_used_count: 0 });
+	}
+
+	const updateStatement = c.env.DB.prepare(
+		[
+			"UPDATE feedback_items",
+			"SET sentiment = ?, urgency = ?, processed_at = ?, metadata_json = ?",
+			"WHERE id = ?",
+		].join(" "),
+	);
+
+	let classified = 0;
+	let verifierUsedCount = 0;
+	const now = new Date().toISOString();
+
+	for (const item of targets) {
+		try {
+			const classification = await classifyWithVerifierFallback(c.env, item.text);
+			const metadata = parseMetadataJson(item.metadata_json);
+			const nextMetadata = {
+				...metadata,
+				theme_family: classification.theme_family,
+				theme_label: classification.theme_label,
+				confidence: classification.confidence,
+				model: classification.model,
+				verifier_used: classification.verifier_used,
+				rationale: classification.rationale,
+			};
+
+			await updateStatement
+				.bind(
+					classification.sentiment,
+					classification.urgency,
+					now,
+					JSON.stringify(nextMetadata),
+					item.id,
+				)
+				.run();
+
+			classified += 1;
+			if (classification.verifier_used) verifierUsedCount += 1;
+		} catch (error) {
+			console.error(`classification failed for ${item.id}:`, error);
+		}
+	}
+
+	return c.json({
+		processed: classified,
+		classified,
+		verifier_used_count: verifierUsedCount,
+	});
+});
+
 app.post("/api/ingest", async (c) => {
 	let body: unknown;
 	try {
@@ -519,7 +954,7 @@ app.get("/api/items", async (c) => {
 			"SELECT",
 			"id, source, source_ref, url, author, account_tier, product_area,",
 			"created_at, ingested_at, location_region, location_country, location_colo,",
-			"text, metadata_json",
+			"text, sentiment, urgency, processed_at, metadata_json",
 			"FROM feedback_items",
 			where.length ? `WHERE ${where.join(" AND ")}` : "",
 			"ORDER BY created_at DESC",
@@ -545,19 +980,14 @@ app.get("/api/items", async (c) => {
 				location_country: string | null;
 				location_colo: string | null;
 				text: string;
+				sentiment: Sentiment | null;
+				urgency: Urgency | null;
+				processed_at: string | null;
 				metadata_json: string | null;
 			}>();
 
 		const items = (results.results ?? []).map((r) => {
-			let metadata: Record<string, unknown> = {};
-			if (typeof r.metadata_json === "string" && r.metadata_json.length) {
-				try {
-					const parsed = JSON.parse(r.metadata_json) as unknown;
-					if (isRecord(parsed)) metadata = parsed;
-				} catch {
-					metadata = {};
-				}
-			}
+			const metadata = parseMetadataJson(r.metadata_json);
 
 			const out: FeedbackItem & { ingested_at: string } = {
 				id: r.id,
@@ -572,6 +1002,9 @@ app.get("/api/items", async (c) => {
 				location_country: r.location_country ?? undefined,
 				location_colo: r.location_colo ?? undefined,
 				text: r.text,
+				sentiment: r.sentiment ?? undefined,
+				urgency: r.urgency ?? undefined,
+				processed_at: r.processed_at ?? undefined,
 				metadata,
 				ingested_at: r.ingested_at,
 			};

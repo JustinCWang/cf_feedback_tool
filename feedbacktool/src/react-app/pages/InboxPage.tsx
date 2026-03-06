@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { FeedbackTable } from "../components/FeedbackTable";
 import { FilterBar } from "../components/FilterBar";
+import { LoadingRing } from "../components/LoadingRing";
 import { PageHeader } from "../components/PageHeader";
 import { SectionCard } from "../components/SectionCard";
 import { getItems, type ItemsResponse } from "../lib/api";
@@ -126,7 +127,10 @@ export function InboxPage() {
 				}
 			>
 				{loading ? (
-					<p className="muted-text">Loading inbox items...</p>
+					<div className="loading-inline">
+						<LoadingRing label="Loading inbox items" size="sm" />
+						<p className="muted-text">Loading inbox items...</p>
+					</div>
 				) : error ? (
 					<p className="error-text">{error}</p>
 				) : (

@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { DatasetActions } from "../components/DatasetActions";
 import { FeedbackTable } from "../components/FeedbackTable";
+import { LoadingRing } from "../components/LoadingRing";
 import { PageHeader } from "../components/PageHeader";
 import { SectionCard } from "../components/SectionCard";
-import { getItems, ingestItems } from "../lib/api";
+import { analyzeItems, getItems, ingestItems } from "../lib/api";
 import { loadDataset, type DatasetKind } from "../lib/mock-data";
 
 export function IngestPage() {
 	const [busy, setBusy] = useState(false);
+	const [analyzing, setAnalyzing] = useState(false);
 	const [status, setStatus] = useState("");
 	const [preview, setPreview] = useState<Array<
 		Awaited<ReturnType<typeof getItems>>["items"][number]
@@ -31,6 +33,27 @@ export function IngestPage() {
 		}
 	}
 
+	async function handleAnalyze() {
+		setAnalyzing(true);
+		setStatus("");
+		try {
+			const result = await analyzeItems(100);
+			const latest = await getItems({ limit: 8, offset: 0 });
+			setPreview(latest.items);
+			setStatus(
+				[
+					`Analyzed ${result.classified} items.`,
+					`Updated ${result.processed} rows.`,
+					`Verifier used ${result.verifier_used_count} times.`,
+				].join(" "),
+			);
+		} catch (error) {
+			setStatus(error instanceof Error ? error.message : "Analysis failed.");
+		} finally {
+			setAnalyzing(false);
+		}
+	}
+
 	return (
 		<div className="page-stack">
 			<PageHeader
@@ -49,23 +72,39 @@ export function IngestPage() {
 				</SectionCard>
 
 				<SectionCard
-					title="Remote D1 workflow"
-					description="After deploy, seed the remote Worker URL instead of the local dev server."
+					title="AI classification"
+					description="Run Workers AI sentiment, urgency, and theme labeling on the newest unprocessed feedback."
 				>
-					<div className="code-note">
-						<code>npm run db:migrate:remote</code>
-						<code>npm run deploy</code>
-						<code>
-							node ./scripts/ingest-mock-data.mjs --dataset all --url
-							https://&lt;your-worker&gt;.workers.dev
-						</code>
+					<div className="action-stack">
+						<button type="button" onClick={handleAnalyze} disabled={busy || analyzing}>
+							{analyzing ? <LoadingRing label="Analyzing feedback" size="sm" /> : null}
+							<span>{analyzing ? "Analyzing feedback..." : "Analyze unprocessed items"}</span>
+						</button>
+						<p className="muted-text">
+							Uses JSON Mode with an 8B primary model and a stronger verifier when
+							confidence is low or guardrails are violated.
+						</p>
 					</div>
 				</SectionCard>
 			</div>
 
 			<SectionCard
+				title="Remote D1 workflow"
+				description="After deploy, seed the remote Worker URL instead of the local dev server."
+			>
+				<div className="code-note">
+					<code>npm run db:migrate:remote</code>
+					<code>npm run deploy</code>
+					<code>
+						node ./scripts/ingest-mock-data.mjs --dataset all --url
+						https://&lt;your-worker&gt;.workers.dev
+					</code>
+				</div>
+			</SectionCard>
+
+			<SectionCard
 				title="Latest ingested items"
-				description="Quick verification view after each seed action."
+				description="Quick verification view after each seed or analysis action."
 			>
 				<FeedbackTable items={preview} />
 			</SectionCard>

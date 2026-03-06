@@ -8,6 +8,9 @@ export type FeedbackSource =
 
 export type AccountTier = "free" | "pro" | "business" | "enterprise";
 
+export type Sentiment = "positive" | "neutral" | "negative";
+export type Urgency = "low" | "medium" | "high";
+
 export type ProductArea =
 	| "workers"
 	| "zero_trust"
@@ -40,6 +43,10 @@ export interface FeedbackItem {
 	location_region?: Region;
 	location_country?: string;
 	location_colo?: string;
+
+	sentiment?: Sentiment;
+	urgency?: Urgency;
+	processed_at?: string;
 
 	metadata?: Record<string, unknown>;
 }

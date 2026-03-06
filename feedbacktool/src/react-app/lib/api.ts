@@ -18,6 +18,12 @@ export type IngestResponse = {
 	skipped: number;
 };
 
+export type AnalyzeResponse = {
+	processed: number;
+	classified: number;
+	verifier_used_count: number;
+};
+
 export type ItemsResponse = {
 	items: Array<FeedbackItem & { ingested_at: string }>;
 	next_offset: number | null;
@@ -127,6 +133,20 @@ export async function ingestItems(items: FeedbackItem[]): Promise<IngestResponse
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ items }),
+		}),
+	);
+}
+
+export async function analyzeItems(maxItems: number = 100): Promise<AnalyzeResponse> {
+	return readJson<AnalyzeResponse>(
+		await fetch("/api/analyze", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				scope: "unprocessed",
+				steps: { classify: true },
+				limits: { max_items: maxItems },
+			}),
 		}),
 	);
 }
