@@ -65,10 +65,38 @@ type AnalyzeRequest = {
 	steps?: {
 		classify?: boolean;
 		embed?: boolean;
+		cluster?: boolean;
 	};
 	limits?: {
 		max_items?: number;
 	};
+};
+
+type ClusterCandidateRow = {
+	id: string;
+	source: FeedbackSource;
+	account_tier: AccountTier | null;
+	product_area: ProductArea | null;
+	created_at: string;
+	text: string;
+	sentiment: Sentiment | null;
+	urgency: Urgency | null;
+	embedding_id: string | null;
+	metadata_json: string | null;
+};
+
+type ThemeListRow = {
+	id: string;
+	name: string;
+	summary: string | null;
+	sentiment: Sentiment | null;
+	urgency: Urgency | null;
+	volume_24h: number | string;
+	volume_7d: number | string;
+	first_seen_at: string | null;
+	last_seen_at: string | null;
+	updated_at: string;
+	item_count: number | string;
 };
 
 type SearchResultRow = {
@@ -268,6 +296,100 @@ function readMetadataString(
 
 function compactText(value: string): string {
 	return value.replace(/\s+/g, " ").trim();
+}
+
+function toDisplayLabel(value: string): string {
+	return value
+		.replace(/_/g, " ")
+		.replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function countBy<T extends string>(values: Array<T | null | undefined>): Map<T, number> {
+	const counts = new Map<T, number>();
+	for (const value of values) {
+		if (!value) continue;
+		counts.set(value, (counts.get(value) ?? 0) + 1);
+	}
+	return counts;
+}
+
+function mostFrequent<T extends string>(values: Array<T | null | undefined>): T | null {
+	const counts = countBy(values);
+	let winner: T | null = null;
+	let winnerCount = -1;
+	for (const [value, count] of counts.entries()) {
+		if (count > winnerCount) {
+			winner = value;
+			winnerCount = count;
+		}
+	}
+	return winner;
+}
+
+function urgencyWeight(value: Urgency | null | undefined): number {
+	switch (value) {
+		case "high":
+			return 3;
+		case "medium":
+			return 2;
+		case "low":
+			return 1;
+		default:
+			return 0;
+	}
+}
+
+function pickHighestUrgency(values: Array<Urgency | null | undefined>): Urgency | null {
+	let winner: Urgency | null = null;
+	let bestWeight = -1;
+	for (const value of values) {
+		const weight = urgencyWeight(value);
+		if (weight > bestWeight && value) {
+			winner = value;
+			bestWeight = weight;
+		}
+	}
+	return winner;
+}
+
+function pickDominantSentiment(
+	values: Array<Sentiment | null | undefined>,
+): Sentiment | null {
+	return mostFrequent(values);
+}
+
+function buildThemeName(input: {
+	themeFamily?: string | null;
+	themeLabel?: string | null;
+	productArea?: ProductArea | null;
+}): string {
+	const family = input.themeFamily ? toDisplayLabel(input.themeFamily) : null;
+	const label = input.themeLabel ? toDisplayLabel(input.themeLabel) : null;
+	const product = input.productArea ? toDisplayLabel(input.productArea) : null;
+
+	if (family && label) return `${family}: ${label}`;
+	if (product && label) return `${product}: ${label}`;
+	if (label) return label;
+	if (family && product) return `${family}: ${product}`;
+	return product ?? family ?? "Related feedback cluster";
+}
+
+function buildThemeSummary(
+	rows: ClusterCandidateRow[],
+	input: {
+		themeFamily?: string | null;
+		themeLabel?: string | null;
+		productArea?: ProductArea | null;
+	},
+): string {
+	const sourceCount = new Set(rows.map((row) => row.source)).size;
+	const label = input.themeLabel ? toDisplayLabel(input.themeLabel).toLowerCase() : "related issues";
+	const product = input.productArea ? toDisplayLabel(input.productArea) : "the product";
+	const excerpt = compactText(rows[0]?.text ?? "");
+	const trimmedExcerpt =
+		excerpt.length > 140 ? `${excerpt.slice(0, 137).trimEnd()}...` : excerpt;
+
+	return `${rows.length} related items across ${sourceCount} sources around ${label} in ${product}. Recent reports include: "${trimmedExcerpt}"`;
 }
 
 function buildEmbeddingText(input: {
@@ -552,6 +674,8 @@ const PRIMARY_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 const VERIFIER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const VECTOR_NAMESPACE = "feedback";
+const CLUSTER_TOP_K = 8;
+const CLUSTER_SCORE_THRESHOLD = 0.78;
 
 const SENTIMENTS: readonly Sentiment[] = ["positive", "neutral", "negative"];
 const URGENCY_LEVELS: readonly Urgency[] = ["low", "medium", "high"];
@@ -878,6 +1002,7 @@ app.post("/api/analyze", async (c) => {
 	const scope = request.scope ?? "unprocessed";
 	const classify = request.steps?.classify ?? false;
 	const embed = request.steps?.embed ?? false;
+	const cluster = request.steps?.cluster ?? false;
 	const maxItems = parseIntParam(String(request.limits?.max_items ?? ""), {
 		fallback: 100,
 		min: 1,
@@ -887,10 +1012,10 @@ app.post("/api/analyze", async (c) => {
 	if (scope !== "unprocessed") {
 		return jsonError("Only scope=unprocessed is supported right now.", 400);
 	}
-	if (!classify && !embed) {
+	if (!classify && !embed && !cluster) {
 		return jsonError("Specify at least one analyze step.", 400);
 	}
-	if (embed && !c.env.VECTORIZE) {
+	if ((embed || cluster) && !c.env.VECTORIZE) {
 		return jsonError(
 			"Vectorize is not configured for this Worker yet.",
 			503,
@@ -899,39 +1024,43 @@ app.post("/api/analyze", async (c) => {
 	}
 
 	let targets: AnalyzeTargetRow[] = [];
-	try {
-		const pendingPredicates: string[] = [];
-		if (classify) {
-			pendingPredicates.push("sentiment IS NULL", "urgency IS NULL");
-		}
-		if (embed) {
-			pendingPredicates.push("embedding_id IS NULL");
-		}
+	if (classify || embed) {
+		try {
+			const pendingPredicates: string[] = [];
+			if (classify) {
+				pendingPredicates.push("sentiment IS NULL", "urgency IS NULL");
+			}
+			if (embed) {
+				pendingPredicates.push("embedding_id IS NULL");
+			}
 
-		const result = await c.env.DB.prepare(
-			[
-				"SELECT",
-				"id, text, source, source_ref, url, account_tier, product_area, created_at,",
-				"sentiment, urgency, embedding_id, metadata_json",
-				"FROM feedback_items",
-				`WHERE ${pendingPredicates.join(" OR ")}`,
-				"ORDER BY created_at DESC",
-				"LIMIT ?",
-			].join(" "),
-		)
-			.bind(maxItems)
-			.all<AnalyzeTargetRow>();
-		targets = result.results ?? [];
-	} catch (error) {
-		console.error("analyze target query failed:", error);
-		return jsonError("Failed to load items for analysis.", 500, "internal_error");
+			const result = await c.env.DB.prepare(
+				[
+					"SELECT",
+					"id, text, source, source_ref, url, account_tier, product_area, created_at,",
+					"sentiment, urgency, embedding_id, metadata_json",
+					"FROM feedback_items",
+					`WHERE ${pendingPredicates.join(" OR ")}`,
+					"ORDER BY created_at DESC",
+					"LIMIT ?",
+				].join(" "),
+			)
+				.bind(maxItems)
+				.all<AnalyzeTargetRow>();
+			targets = result.results ?? [];
+		} catch (error) {
+			console.error("analyze target query failed:", error);
+			return jsonError("Failed to load items for analysis.", 500, "internal_error");
+		}
 	}
 
-	if (targets.length === 0) {
+	if (!cluster && targets.length === 0) {
 		return c.json({
 			processed: 0,
 			classified: 0,
 			embedded: 0,
+			clustered: 0,
+			themes_updated: 0,
 			verifier_used_count: 0,
 		});
 	}
@@ -949,6 +1078,8 @@ app.post("/api/analyze", async (c) => {
 
 	let classified = 0;
 	let embedded = 0;
+	let clustered = 0;
+	let themesUpdated = 0;
 	let verifierUsedCount = 0;
 	const now = new Date().toISOString();
 	const latestMetadataById = new Map<string, Record<string, unknown>>();
@@ -1053,10 +1184,223 @@ app.post("/api/analyze", async (c) => {
 		}
 	}
 
+	if (cluster && c.env.VECTORIZE) {
+		try {
+			const clusterCandidatesResult = await c.env.DB.prepare(
+				[
+					"SELECT",
+					"id, source, account_tier, product_area, created_at, text, sentiment, urgency, embedding_id, metadata_json",
+					"FROM feedback_items",
+					"WHERE embedding_id IS NOT NULL",
+					"ORDER BY created_at DESC",
+					"LIMIT ?",
+				].join(" "),
+			)
+				.bind(maxItems)
+				.all<ClusterCandidateRow>();
+
+			const clusterCandidates = clusterCandidatesResult.results ?? [];
+			if (clusterCandidates.length > 0) {
+				const candidateById = new Map(
+					clusterCandidates.map((candidate) => [candidate.id, candidate] as const),
+				);
+				const metadataById = new Map(
+					clusterCandidates.map((candidate) => [
+						candidate.id,
+						parseMetadataJson(candidate.metadata_json),
+					] as const),
+				);
+
+				const parent = new Map<string, string>();
+				for (const candidate of clusterCandidates) {
+					parent.set(candidate.id, candidate.id);
+				}
+
+				const find = (id: string): string => {
+					let current = parent.get(id) ?? id;
+					while (current !== (parent.get(current) ?? current)) {
+						current = parent.get(current) ?? current;
+					}
+					let node = id;
+					while ((parent.get(node) ?? node) !== current) {
+						const next = parent.get(node) ?? node;
+						parent.set(node, current);
+						node = next;
+					}
+					return current;
+				};
+
+				const union = (left: string, right: string) => {
+					const leftRoot = find(left);
+					const rightRoot = find(right);
+					if (leftRoot !== rightRoot) {
+						parent.set(rightRoot, leftRoot);
+					}
+				};
+
+				for (const candidate of clusterCandidates) {
+					const candidateMetadata = metadataById.get(candidate.id) ?? {};
+					const candidateThemeFamily = readMetadataString(
+						candidateMetadata,
+						"theme_family",
+					);
+
+					try {
+						const matches = await c.env.VECTORIZE.queryById(candidate.id, {
+							topK: CLUSTER_TOP_K,
+							namespace: VECTOR_NAMESPACE,
+							returnMetadata: "all",
+						});
+
+						for (const match of matches.matches) {
+							if (match.id === candidate.id) continue;
+							if (match.score < CLUSTER_SCORE_THRESHOLD) continue;
+
+							const neighbor = candidateById.get(match.id);
+							if (!neighbor) continue;
+
+							const neighborMetadata = metadataById.get(match.id) ?? {};
+							const neighborThemeFamily = readMetadataString(
+								neighborMetadata,
+								"theme_family",
+							);
+
+							if (
+								candidate.product_area &&
+								neighbor.product_area &&
+								candidate.product_area !== neighbor.product_area
+							) {
+								continue;
+							}
+							if (
+								candidateThemeFamily &&
+								neighborThemeFamily &&
+								candidateThemeFamily !== neighborThemeFamily
+							) {
+								continue;
+							}
+
+							union(candidate.id, neighbor.id);
+						}
+					} catch (error) {
+						console.error(`cluster neighbor lookup failed for ${candidate.id}:`, error);
+					}
+				}
+
+				const groups = new Map<string, ClusterCandidateRow[]>();
+				for (const candidate of clusterCandidates) {
+					const root = find(candidate.id);
+					const group = groups.get(root) ?? [];
+					group.push(candidate);
+					groups.set(root, group);
+				}
+
+				const assignStatement = c.env.DB.prepare(
+					"UPDATE feedback_items SET theme_id = ? WHERE id = ?",
+				);
+				const clearStatement = c.env.DB.prepare(
+					"UPDATE feedback_items SET theme_id = NULL WHERE id = ?",
+				);
+				const upsertThemeStatement = c.env.DB.prepare(
+					[
+						"INSERT INTO themes (",
+						"id, name, summary, sentiment, urgency, volume_24h, volume_7d,",
+						"first_seen_at, last_seen_at, updated_at",
+						") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+						"ON CONFLICT(id) DO UPDATE SET",
+						"name = excluded.name,",
+						"summary = excluded.summary,",
+						"sentiment = excluded.sentiment,",
+						"urgency = excluded.urgency,",
+						"volume_24h = excluded.volume_24h,",
+						"volume_7d = excluded.volume_7d,",
+						"first_seen_at = excluded.first_seen_at,",
+						"last_seen_at = excluded.last_seen_at,",
+						"updated_at = excluded.updated_at",
+					].join(" "),
+				);
+
+				await Promise.all(
+					clusterCandidates.map((candidate) => clearStatement.bind(candidate.id).run()),
+				);
+
+				for (const group of groups.values()) {
+					if (group.length < 2) continue;
+
+					const sortedIds = group.map((row) => row.id).sort();
+					const themeId = `t_${(await sha256Hex(sortedIds.join("|"))).slice(0, 12)}`;
+					const themeMetadatas = group.map(
+						(row) => metadataById.get(row.id) ?? {},
+					);
+					const dominantThemeLabel =
+						mostFrequent(
+							themeMetadatas.map(
+								(metadata) =>
+									readMetadataString(metadata, "theme_label") ??
+									readMetadataString(metadata, "theme"),
+							),
+						) ?? null;
+					const dominantThemeFamily =
+						mostFrequent(
+							themeMetadatas.map((metadata) =>
+								readMetadataString(metadata, "theme_family"),
+							),
+						) ?? null;
+					const dominantProductArea =
+						mostFrequent(group.map((row) => row.product_area)) ?? null;
+					const themeName = buildThemeName({
+						themeFamily: dominantThemeFamily,
+						themeLabel: dominantThemeLabel,
+						productArea: dominantProductArea,
+					});
+					const themeSummary = buildThemeSummary(group, {
+						themeFamily: dominantThemeFamily,
+						themeLabel: dominantThemeLabel,
+						productArea: dominantProductArea,
+					});
+					const sentiment = pickDominantSentiment(
+						group.map((row) => row.sentiment),
+					);
+					const urgency = pickHighestUrgency(group.map((row) => row.urgency));
+					const createdAts = group.map((row) => row.created_at).sort();
+					const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+					const last7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+					const volume24h = group.filter((row) => row.created_at >= last24h).length;
+					const volume7d = group.filter((row) => row.created_at >= last7d).length;
+
+					await upsertThemeStatement
+						.bind(
+							themeId,
+							themeName,
+							themeSummary,
+							sentiment,
+							urgency,
+							volume24h,
+							volume7d,
+							createdAts[0] ?? now,
+							createdAts[createdAts.length - 1] ?? now,
+							now,
+						)
+						.run();
+
+					await Promise.all(
+						group.map((row) => assignStatement.bind(themeId, row.id).run()),
+					);
+					clustered += group.length;
+					themesUpdated += 1;
+				}
+			}
+		} catch (error) {
+			console.error("theme clustering failed:", error);
+		}
+	}
+
 	return c.json({
-		processed: classified + embedded,
+		processed: classified + embedded + clustered,
 		classified,
 		embedded,
+		clustered,
+		themes_updated: themesUpdated,
 		verifier_used_count: verifierUsedCount,
 	});
 });
@@ -1192,6 +1536,82 @@ app.post("/api/ingest", async (c) => {
 	} catch (err) {
 		console.error("ingest failed:", err);
 		return jsonError("Failed to ingest items.", 500, "internal_error");
+	}
+});
+
+app.get("/api/themes", async (c) => {
+	const limit = parseIntParam(c.req.query("limit"), {
+		fallback: 12,
+		min: 1,
+		max: 50,
+	});
+	const offset = parseIntParam(c.req.query("offset"), {
+		fallback: 0,
+		min: 0,
+		max: Number.MAX_SAFE_INTEGER,
+	});
+	const sort = c.req.query("sort") ?? "volume_24h_desc";
+	const allowedSorts = new Set([
+		"volume_24h_desc",
+		"volume_7d_desc",
+		"urgency_desc",
+		"updated_at_desc",
+	]);
+	if (!allowedSorts.has(sort)) {
+		return jsonError("Invalid sort option for themes.", 400);
+	}
+
+	const orderBy =
+		sort === "volume_7d_desc"
+			? "themes.volume_7d DESC, themes.updated_at DESC"
+			: sort === "urgency_desc"
+				? [
+						"CASE themes.urgency",
+						"WHEN 'high' THEN 3",
+						"WHEN 'medium' THEN 2",
+						"WHEN 'low' THEN 1",
+						"ELSE 0 END DESC,",
+						"themes.volume_24h DESC, themes.updated_at DESC",
+					].join(" ")
+				: sort === "updated_at_desc"
+					? "themes.updated_at DESC"
+					: "themes.volume_24h DESC, themes.updated_at DESC";
+
+	try {
+		const results = await c.env.DB.prepare(
+			[
+				"SELECT",
+				"themes.id, themes.name, themes.summary, themes.sentiment, themes.urgency,",
+				"themes.volume_24h, themes.volume_7d, themes.first_seen_at, themes.last_seen_at, themes.updated_at,",
+				"COUNT(feedback_items.id) AS item_count",
+				"FROM themes",
+				"JOIN feedback_items ON feedback_items.theme_id = themes.id",
+				"GROUP BY themes.id",
+				`ORDER BY ${orderBy}`,
+				"LIMIT ? OFFSET ?",
+			].join(" "),
+		)
+			.bind(limit, offset)
+			.all<ThemeListRow>();
+
+		return c.json({
+			themes: (results.results ?? []).map((row) => ({
+				id: row.id,
+				name: row.name,
+				summary: row.summary,
+				sentiment: row.sentiment,
+				urgency: row.urgency,
+				volume_24h: toCount(row.volume_24h),
+				volume_7d: toCount(row.volume_7d),
+				first_seen_at: row.first_seen_at,
+				last_seen_at: row.last_seen_at,
+				updated_at: row.updated_at,
+				item_count: toCount(row.item_count),
+			})),
+		});
+	} catch (error) {
+		console.error("themes query failed:", error);
+		return jsonError("Failed to fetch themes.", 500, "internal_error");
 	}
 });
 

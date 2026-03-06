@@ -518,6 +518,11 @@
 	margin: 0.8rem 0;
 }
 
+.theme-card__title {
+	margin: 0.85rem 0 0;
+	font-size: 1rem;
+}
+
 .search-result-card__meta {
 	color: var(--text-soft);
 	font-size: 0.92rem;

@@ -22,6 +22,8 @@ export type AnalyzeResponse = {
 	processed: number;
 	classified: number;
 	embedded?: number;
+	clustered?: number;
+	themes_updated?: number;
 	verifier_used_count: number;
 };
 
@@ -74,6 +76,24 @@ export type TrendsResponse = {
 	theme_timeline: ThemeTimelinePoint[];
 };
 
+export type ThemeSummary = {
+	id: string;
+	name: string;
+	summary: string | null;
+	sentiment: string | null;
+	urgency: string | null;
+	volume_24h: number;
+	volume_7d: number;
+	first_seen_at: string | null;
+	last_seen_at: string | null;
+	updated_at: string;
+	item_count: number;
+};
+
+export type ThemesResponse = {
+	themes: ThemeSummary[];
+};
+
 export type SearchResult = FeedbackItem & {
 	score: number | null;
 };
@@ -100,15 +120,9 @@ async function readJson<T>(response: Response): Promise<T> {
 	return data as T;
 }
 
-function buildItemsSearch(params: {
-	limit?: number;
-	offset?: number;
-	source?: string;
-	product_area?: string;
-	account_tier?: string;
-	from?: string;
-	to?: string;
-}) {
+function buildItemsSearch(
+	params: Record<string, string | number | undefined>,
+) {
 	const search = new URLSearchParams();
 
 	for (const [key, value] of Object.entries(params)) {
@@ -130,6 +144,10 @@ export async function getOverview(): Promise<OverviewResponse> {
 
 export async function getTrends(): Promise<TrendsResponse> {
 	return readJson<TrendsResponse>(await fetch("/api/trends"));
+}
+
+export async function getThemes(): Promise<ThemesResponse> {
+	return readJson<ThemesResponse>(await fetch("/api/themes"));
 }
 
 export async function getItems(params: {
@@ -158,7 +176,7 @@ export async function ingestItems(items: FeedbackItem[]): Promise<IngestResponse
 
 export async function analyzeItems(
 	maxItems: number = 100,
-	steps: { classify?: boolean; embed?: boolean } = {
+	steps: { classify?: boolean; embed?: boolean; cluster?: boolean } = {
 		classify: true,
 		embed: true,
 	},
