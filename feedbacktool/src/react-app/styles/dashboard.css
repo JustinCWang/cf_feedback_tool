@@ -245,6 +245,19 @@
 	border-radius: 18px;
 	border: 1px solid var(--border-muted);
 	background: #ffffff;
+	color: var(--text-strong);
+	box-shadow: none;
+}
+
+.dataset-action:hover {
+	border-color: #ffd4ad;
+	background: #fffaf5;
+	box-shadow: 0 6px 18px rgba(247, 130, 18, 0.1);
+}
+
+.dataset-action:disabled {
+	color: var(--text-strong);
+	background: #ffffff;
 }
 
 .dataset-action__title {
@@ -252,6 +265,7 @@
 	align-items: center;
 	gap: 0.45rem;
 	font-weight: 650;
+	color: var(--text-strong);
 }
 
 .dataset-action__description {
