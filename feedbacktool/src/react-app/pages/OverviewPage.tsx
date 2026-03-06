@@ -101,12 +101,12 @@ export function OverviewPage() {
 
 						<SectionCard
 							title="Active storylines"
-							description="Themes inferred from the seeded metadata in recent records."
+							description="Stored theme clusters built from analyzed and embedded feedback."
 						>
 							{data.top_themes.length === 0 ? (
 								<EmptyState
-									title="No theme signals yet"
-									description="Ingest mock data to surface WAF, Zero Trust, and Analytics storylines."
+									title="No stored themes yet"
+									description="Run classification, indexing, and clustering to surface the strongest issue groups."
 								/>
 							) : (
 								<div className="metric-list">
@@ -160,6 +160,30 @@ export function OverviewPage() {
 							</div>
 						</SectionCard>
 					</div>
+
+					<SectionCard
+						title="Latest digest"
+						description="Most recent PM narrative generated from the analyzed feedback stream."
+					>
+						{data.latest_digest ? (
+							<div className="search-results__summary">
+								<p className="search-results__summary-text">
+									{data.latest_digest.text}
+								</p>
+								<div className="search-result-card__meta">
+									<span>Generated {formatDateTime(data.latest_digest.created_at)}</span>
+									<span>
+										Window ended {formatDateTime(data.latest_digest.window_end)}
+									</span>
+								</div>
+							</div>
+						) : (
+							<EmptyState
+								title="No digest generated yet"
+								description="Create a digest from the Digests page to get a narrative summary here."
+							/>
+						)}
+					</SectionCard>
 				</>
 			)}
 		</div>

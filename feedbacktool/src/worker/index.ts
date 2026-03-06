@@ -99,6 +99,14 @@ type ThemeListRow = {
 	item_count: number | string;
 };
 
+type DigestRow = {
+	id: string;
+	window_start: string;
+	window_end: string;
+	text: string;
+	created_at: string;
+};
+
 type SearchResultRow = {
 	id: string;
 	source: FeedbackSource;
@@ -518,6 +526,97 @@ async function generateSearchAnswer(
 	);
 }
 
+function buildDigestFallback(input: {
+	windowHours: number;
+	totalItems: number;
+	topThemeName: string | null;
+	topThemeVolume: number;
+	topSourceName: string | null;
+	topSourceCount: number;
+	notableItemText: string | null;
+}): string {
+	const parts = [
+		`Feedback digest for the last ${input.windowHours} hours: ${input.totalItems} items were reviewed.`,
+		input.topThemeName
+			? `The strongest cluster is ${input.topThemeName} with ${input.topThemeVolume} related items.`
+			: "No strong theme cluster has formed yet.",
+		input.topSourceName
+			? `The busiest source is ${toDisplayLabel(input.topSourceName)} with ${input.topSourceCount} items.`
+			: null,
+		input.notableItemText
+			? `Representative feedback: "${input.notableItemText}".`
+			: null,
+	];
+
+	return parts.filter((part): part is string => Boolean(part)).join(" ");
+}
+
+async function generateDigestNarrative(
+	env: WorkerBindings,
+	input: {
+		windowHours: number;
+		totalItems: number;
+		themes: Array<{ name: string; summary: string | null; volume: number; urgency: string | null }>;
+		sources: Array<{ key: string; count: number }>;
+		notableItems: Array<{ id: string; text: string; source: FeedbackSource }>;
+	},
+): Promise<string> {
+	const prompt = [
+		`Create a concise PM digest for the last ${input.windowHours} hours of feedback.`,
+		`Total feedback items: ${input.totalItems}.`,
+		"",
+		"Top themes:",
+		...(input.themes.length
+			? input.themes.map(
+					(theme) =>
+						`- ${theme.name}: ${theme.volume} items, urgency=${theme.urgency ?? "unknown"}, summary=${theme.summary ?? "n/a"}`,
+				)
+			: ["- No material theme clusters yet"]),
+		"",
+		"Source mix:",
+		...(input.sources.length
+			? input.sources.map((source) => `- ${source.key}: ${source.count}`)
+			: ["- No source data"]),
+		"",
+		"Representative feedback:",
+		...(input.notableItems.length
+			? input.notableItems.map(
+					(item) => `- [${item.id}] (${item.source}) ${compactText(item.text)}`,
+				)
+			: ["- No representative items"]),
+		"",
+		"Write 2-4 sentences in a crisp PM update tone. Mention the biggest issue, where it is showing up, and what to watch next.",
+	].join("\n");
+
+	const response = await runTextModel(env, PRIMARY_MODEL, {
+		messages: [
+			{
+				role: "system",
+				content:
+					"You write concise executive PM digests from structured feedback analysis.",
+			},
+			{
+				role: "user",
+				content: prompt,
+			},
+		],
+		max_tokens: 260,
+		temperature: 0.3,
+	});
+
+	return typeof response.response === "string" && response.response.trim()
+		? response.response.trim()
+		: buildDigestFallback({
+				windowHours: input.windowHours,
+				totalItems: input.totalItems,
+				topThemeName: input.themes[0]?.name ?? null,
+				topThemeVolume: input.themes[0]?.volume ?? 0,
+				topSourceName: input.sources[0]?.key ?? null,
+				topSourceCount: input.sources[0]?.count ?? 0,
+				notableItemText: input.notableItems[0]?.text ?? null,
+			});
+}
+
 function violatesUrgencyGuardrails(
 	text: string,
 	classification: ModelClassification,
@@ -827,7 +926,7 @@ app.get("/api/overview", async (c) => {
 			.bind(last24h, last7d)
 			.first<TotalsRow>();
 
-		const [bySource, byProductArea, byAccountTier, topThemes] = await Promise.all([
+		const [bySource, byProductArea, byAccountTier, topThemes, latestDigest] = await Promise.all([
 			queryBreakdown(
 				c.env.DB.prepare(
 					[
@@ -866,15 +965,23 @@ app.get("/api/overview", async (c) => {
 			queryBreakdown(
 				c.env.DB.prepare(
 					[
-						"SELECT json_extract(metadata_json, '$.theme') AS key, COUNT(*) AS count",
-						"FROM feedback_items",
-						"WHERE json_extract(metadata_json, '$.theme') IS NOT NULL",
-						"GROUP BY json_extract(metadata_json, '$.theme')",
-						"ORDER BY count DESC, key ASC",
+						"SELECT themes.name AS key, COUNT(feedback_items.id) AS count",
+						"FROM themes",
+						"JOIN feedback_items ON feedback_items.theme_id = themes.id",
+						"GROUP BY themes.id",
+						"ORDER BY count DESC, themes.updated_at DESC",
 						"LIMIT 5",
 					].join(" "),
 				),
 			),
+			c.env.DB.prepare(
+				[
+					"SELECT id, window_start, window_end, text, created_at",
+					"FROM digests",
+					"ORDER BY created_at DESC",
+					"LIMIT 1",
+				].join(" "),
+			).first<DigestRow>(),
 		]);
 
 		return c.json({
@@ -890,6 +997,7 @@ app.get("/api/overview", async (c) => {
 			by_product_area: byProductArea,
 			by_account_tier: byAccountTier,
 			top_themes: topThemes,
+			latest_digest: latestDigest ?? null,
 		});
 	} catch (error) {
 		console.error("overview query failed:", error);
@@ -1536,6 +1644,169 @@ app.post("/api/ingest", async (c) => {
 	} catch (err) {
 		console.error("ingest failed:", err);
 		return jsonError("Failed to ingest items.", 500, "internal_error");
+	}
+});
+
+app.get("/api/digests", async (c) => {
+	const limit = parseIntParam(c.req.query("limit"), {
+		fallback: 8,
+		min: 1,
+		max: 25,
+	});
+
+	try {
+		const results = await c.env.DB.prepare(
+			[
+				"SELECT id, window_start, window_end, text, created_at",
+				"FROM digests",
+				"ORDER BY created_at DESC",
+				"LIMIT ?",
+			].join(" "),
+		)
+			.bind(limit)
+			.all<DigestRow>();
+
+		return c.json({
+			digests: results.results ?? [],
+		});
+	} catch (error) {
+		console.error("digests query failed:", error);
+		return jsonError("Failed to fetch digests.", 500, "internal_error");
+	}
+});
+
+app.post("/api/digest", async (c) => {
+	let body: unknown = {};
+	try {
+		if (c.req.header("content-type")?.includes("application/json")) {
+			body = await c.req.json();
+		}
+	} catch {
+		return jsonError("Invalid JSON body.", 400);
+	}
+
+	const request = (isRecord(body) ? body : {}) as { window_hours?: number };
+	const windowHours = parseIntParam(
+		request.window_hours !== undefined ? String(request.window_hours) : undefined,
+		{ fallback: 24, min: 1, max: 168 },
+	);
+	const windowStart = new Date(Date.now() - windowHours * 60 * 60 * 1000).toISOString();
+	const windowEnd = new Date().toISOString();
+	const digestId = `d_${(await sha256Hex(`${windowStart}|${windowEnd}`)).slice(0, 12)}`;
+
+	try {
+		const [
+			totalRow,
+			topThemesRow,
+			sourceBreakdown,
+			notableItems,
+		] = await Promise.all([
+			c.env.DB.prepare(
+				[
+					"SELECT COUNT(*) AS total_count",
+					"FROM feedback_items",
+					"WHERE created_at >= ? AND created_at <= ?",
+				].join(" "),
+			)
+				.bind(windowStart, windowEnd)
+				.first<TotalCountRow>(),
+			c.env.DB.prepare(
+				[
+					"SELECT themes.name, themes.summary, themes.urgency, COUNT(feedback_items.id) AS item_count",
+					"FROM themes",
+					"JOIN feedback_items ON feedback_items.theme_id = themes.id",
+					"WHERE feedback_items.created_at >= ? AND feedback_items.created_at <= ?",
+					"GROUP BY themes.id",
+					"ORDER BY item_count DESC, themes.updated_at DESC",
+					"LIMIT 3",
+				].join(" "),
+			)
+				.bind(windowStart, windowEnd)
+				.all<{
+					name: string;
+					summary: string | null;
+					urgency: Urgency | null;
+					item_count: number | string;
+				}>(),
+			queryBreakdown(
+				c.env.DB.prepare(
+					[
+						"SELECT source AS key, COUNT(*) AS count",
+						"FROM feedback_items",
+						"WHERE created_at >= ? AND created_at <= ?",
+						"GROUP BY source",
+						"ORDER BY count DESC, key ASC",
+						"LIMIT 4",
+					].join(" "),
+				).bind(windowStart, windowEnd),
+			),
+			c.env.DB.prepare(
+				[
+					"SELECT id, source, text",
+					"FROM feedback_items",
+					"WHERE created_at >= ? AND created_at <= ?",
+					"ORDER BY",
+					"CASE urgency WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,",
+					"created_at DESC",
+					"LIMIT 4",
+				].join(" "),
+			)
+				.bind(windowStart, windowEnd)
+				.all<{ id: string; source: FeedbackSource; text: string }>(),
+		]);
+
+		const totalItems = toCount(totalRow?.total_count);
+		const topThemes = (topThemesRow.results ?? []).map((row) => ({
+			name: row.name,
+			summary: row.summary,
+			urgency: row.urgency,
+			volume: toCount(row.item_count),
+		}));
+		const representativeItems = notableItems.results ?? [];
+		let text = buildDigestFallback({
+			windowHours,
+			totalItems,
+			topThemeName: topThemes[0]?.name ?? null,
+			topThemeVolume: topThemes[0]?.volume ?? 0,
+			topSourceName: sourceBreakdown[0]?.key ?? null,
+			topSourceCount: sourceBreakdown[0]?.count ?? 0,
+			notableItemText: representativeItems[0]?.text ?? null,
+		});
+		try {
+			text = await generateDigestNarrative(c.env, {
+				windowHours,
+				totalItems,
+				themes: topThemes,
+				sources: sourceBreakdown,
+				notableItems: representativeItems,
+			});
+		} catch (error) {
+			console.error("digest AI generation failed, using fallback:", error);
+		}
+
+		await c.env.DB.prepare(
+			[
+				"INSERT INTO digests (id, window_start, window_end, text, created_at)",
+				"VALUES (?, ?, ?, ?, ?)",
+			].join(" "),
+		)
+			.bind(digestId, windowStart, windowEnd, text, windowEnd)
+			.run();
+
+		return c.json({
+			digest: {
+				id: digestId,
+				window_start: windowStart,
+				window_end: windowEnd,
+				text,
+				created_at: windowEnd,
+				top_themes: topThemes,
+				top_sources: sourceBreakdown,
+			},
+		});
+	} catch (error) {
+		console.error("digest generation failed:", error);
+		return jsonError("Failed to generate digest.", 500, "internal_error");
 	}
 });
 

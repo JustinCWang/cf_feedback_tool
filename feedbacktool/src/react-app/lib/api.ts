@@ -54,6 +54,7 @@ export type OverviewResponse = {
 	by_product_area: BreakdownDatum[];
 	by_account_tier: BreakdownDatum[];
 	top_themes: BreakdownDatum[];
+	latest_digest: DigestSummary | null;
 };
 
 export type TrendPoint = {
@@ -92,6 +93,30 @@ export type ThemeSummary = {
 
 export type ThemesResponse = {
 	themes: ThemeSummary[];
+};
+
+export type DigestSummary = {
+	id: string;
+	window_start: string;
+	window_end: string;
+	text: string;
+	created_at: string;
+};
+
+export type DigestsResponse = {
+	digests: DigestSummary[];
+};
+
+export type GenerateDigestResponse = {
+	digest: DigestSummary & {
+		top_themes: Array<{
+			name: string;
+			summary: string | null;
+			urgency: string | null;
+			volume: number;
+		}>;
+		top_sources: BreakdownDatum[];
+	};
 };
 
 export type SearchResult = FeedbackItem & {
@@ -150,6 +175,10 @@ export async function getThemes(): Promise<ThemesResponse> {
 	return readJson<ThemesResponse>(await fetch("/api/themes"));
 }
 
+export async function getDigests(): Promise<DigestsResponse> {
+	return readJson<DigestsResponse>(await fetch("/api/digests"));
+}
+
 export async function getItems(params: {
 	limit?: number;
 	offset?: number;
@@ -205,4 +234,14 @@ export async function searchItems(params: {
 }): Promise<SearchResponse> {
 	const search = buildItemsSearch(params);
 	return readJson<SearchResponse>(await fetch(`/api/search?${search}`));
+}
+
+export async function generateDigest(windowHours: number = 24): Promise<GenerateDigestResponse> {
+	return readJson<GenerateDigestResponse>(
+		await fetch("/api/digest", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ window_hours: windowHours }),
+		}),
+	);
 }
