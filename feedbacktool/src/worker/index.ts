@@ -13,6 +13,27 @@ type HealthCheckRow = {
 	ok: number;
 };
 
+type CountRow = {
+	key: string | null;
+	count: number | string;
+};
+
+type TotalsRow = {
+	total_items: number | string;
+	items_last_24h: number | string | null;
+	items_last_7d: number | string | null;
+	active_sources: number | string;
+	active_product_areas: number | string;
+	latest_ingested_at: string | null;
+};
+
+type ThemeTimelineRow = {
+	bucket: string;
+	waf_false_positive: number | string;
+	sso_loop: number | string;
+	analytics_delay: number | string;
+};
+
 function jsonError(
 	message: string,
 	status: number,
@@ -41,6 +62,24 @@ async function sha256Hex(input: string): Promise<string> {
 	return Array.from(new Uint8Array(digest))
 		.map((b) => b.toString(16).padStart(2, "0"))
 		.join("");
+}
+
+function toCount(value: number | string | null | undefined): number {
+	if (typeof value === "number") return value;
+	if (typeof value === "string") return Number.parseInt(value, 10) || 0;
+	return 0;
+}
+
+async function queryBreakdown(
+	statement: D1PreparedStatement,
+): Promise<Array<{ key: string; count: number }>> {
+	const result = await statement.all<CountRow>();
+	return (result.results ?? [])
+		.filter((row) => typeof row.key === "string" && row.key.length > 0)
+		.map((row) => ({
+			key: row.key as string,
+			count: toCount(row.count),
+		}));
 }
 
 const FEEDBACK_SOURCES: ReadonlySet<FeedbackSource> = new Set([
@@ -101,6 +140,189 @@ app.get("/api/health", async (c) => {
 			},
 			500,
 		);
+	}
+});
+
+app.get("/api/overview", async (c) => {
+	const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+	const last7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+	try {
+		const totals = await c.env.DB.prepare(
+			[
+				"SELECT",
+				"COUNT(*) AS total_items,",
+				"SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS items_last_24h,",
+				"SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS items_last_7d,",
+				"COUNT(DISTINCT source) AS active_sources,",
+				"COUNT(DISTINCT product_area) AS active_product_areas,",
+				"MAX(ingested_at) AS latest_ingested_at",
+				"FROM feedback_items",
+			].join(" "),
+		)
+			.bind(last24h, last7d)
+			.first<TotalsRow>();
+
+		const [bySource, byProductArea, byAccountTier, topThemes] = await Promise.all([
+			queryBreakdown(
+				c.env.DB.prepare(
+					[
+						"SELECT source AS key, COUNT(*) AS count",
+						"FROM feedback_items",
+						"GROUP BY source",
+						"ORDER BY count DESC, key ASC",
+						"LIMIT 6",
+					].join(" "),
+				),
+			),
+			queryBreakdown(
+				c.env.DB.prepare(
+					[
+						"SELECT product_area AS key, COUNT(*) AS count",
+						"FROM feedback_items",
+						"WHERE product_area IS NOT NULL",
+						"GROUP BY product_area",
+						"ORDER BY count DESC, key ASC",
+						"LIMIT 8",
+					].join(" "),
+				),
+			),
+			queryBreakdown(
+				c.env.DB.prepare(
+					[
+						"SELECT account_tier AS key, COUNT(*) AS count",
+						"FROM feedback_items",
+						"WHERE account_tier IS NOT NULL",
+						"GROUP BY account_tier",
+						"ORDER BY count DESC, key ASC",
+						"LIMIT 4",
+					].join(" "),
+				),
+			),
+			queryBreakdown(
+				c.env.DB.prepare(
+					[
+						"SELECT json_extract(metadata_json, '$.theme') AS key, COUNT(*) AS count",
+						"FROM feedback_items",
+						"WHERE json_extract(metadata_json, '$.theme') IS NOT NULL",
+						"GROUP BY json_extract(metadata_json, '$.theme')",
+						"ORDER BY count DESC, key ASC",
+						"LIMIT 5",
+					].join(" "),
+				),
+			),
+		]);
+
+		return c.json({
+			totals: {
+				total_items: toCount(totals?.total_items),
+				items_last_24h: toCount(totals?.items_last_24h),
+				items_last_7d: toCount(totals?.items_last_7d),
+				active_sources: toCount(totals?.active_sources),
+				active_product_areas: toCount(totals?.active_product_areas),
+				latest_ingested_at: totals?.latest_ingested_at ?? null,
+			},
+			by_source: bySource,
+			by_product_area: byProductArea,
+			by_account_tier: byAccountTier,
+			top_themes: topThemes,
+		});
+	} catch (error) {
+		console.error("overview query failed:", error);
+		return jsonError("Failed to fetch overview.", 500, "internal_error");
+	}
+});
+
+app.get("/api/trends", async (c) => {
+	const last14d = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+
+	try {
+		const [dailyVolumeResult, sourceBreakdown, productAreaBreakdown, tierBreakdown] =
+			await Promise.all([
+				c.env.DB.prepare(
+					[
+						"SELECT substr(created_at, 1, 10) AS key, COUNT(*) AS count",
+						"FROM feedback_items",
+						"WHERE created_at >= ?",
+						"GROUP BY substr(created_at, 1, 10)",
+						"ORDER BY key ASC",
+					].join(" "),
+				)
+					.bind(last14d)
+					.all<CountRow>(),
+				queryBreakdown(
+					c.env.DB.prepare(
+						[
+							"SELECT source AS key, COUNT(*) AS count",
+							"FROM feedback_items",
+							"GROUP BY source",
+							"ORDER BY count DESC, key ASC",
+							"LIMIT 6",
+						].join(" "),
+					),
+				),
+				queryBreakdown(
+					c.env.DB.prepare(
+						[
+							"SELECT product_area AS key, COUNT(*) AS count",
+							"FROM feedback_items",
+							"WHERE product_area IS NOT NULL",
+							"GROUP BY product_area",
+							"ORDER BY count DESC, key ASC",
+							"LIMIT 8",
+						].join(" "),
+					),
+				),
+				queryBreakdown(
+					c.env.DB.prepare(
+						[
+							"SELECT account_tier AS key, COUNT(*) AS count",
+							"FROM feedback_items",
+							"WHERE account_tier IS NOT NULL",
+							"GROUP BY account_tier",
+							"ORDER BY count DESC, key ASC",
+							"LIMIT 4",
+						].join(" "),
+					),
+				),
+			]);
+
+		const themeTimeline = await c.env.DB.prepare(
+			[
+				"SELECT",
+				"substr(created_at, 1, 10) AS bucket,",
+				"SUM(CASE WHEN json_extract(metadata_json, '$.theme') = 'waf_false_positive' THEN 1 ELSE 0 END) AS waf_false_positive,",
+				"SUM(CASE WHEN json_extract(metadata_json, '$.theme') = 'sso_loop' THEN 1 ELSE 0 END) AS sso_loop,",
+				"SUM(CASE WHEN json_extract(metadata_json, '$.theme') = 'analytics_delay' THEN 1 ELSE 0 END) AS analytics_delay",
+				"FROM feedback_items",
+				"WHERE created_at >= ?",
+				"GROUP BY substr(created_at, 1, 10)",
+				"ORDER BY bucket ASC",
+			].join(" "),
+		)
+			.bind(last14d)
+			.all<ThemeTimelineRow>();
+
+		return c.json({
+			daily_volume: (dailyVolumeResult.results ?? [])
+				.filter((row) => typeof row.key === "string")
+				.map((row) => ({
+					bucket: row.key as string,
+					count: toCount(row.count),
+				})),
+			source_breakdown: sourceBreakdown,
+			product_area_breakdown: productAreaBreakdown,
+			tier_breakdown: tierBreakdown,
+			theme_timeline: (themeTimeline.results ?? []).map((row) => ({
+				bucket: row.bucket,
+				waf_false_positive: toCount(row.waf_false_positive),
+				sso_loop: toCount(row.sso_loop),
+				analytics_delay: toCount(row.analytics_delay),
+			})),
+		});
+	} catch (error) {
+		console.error("trends query failed:", error);
+		return jsonError("Failed to fetch trends.", 500, "internal_error");
 	}
 });
 
