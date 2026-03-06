@@ -10,7 +10,8 @@ import type {
 } from "../shared/types";
 
 type WorkerBindings = Env & {
-	AI: Ai<Record<string, BaseAiTextGeneration>>;
+	AI: Ai;
+	VECTORIZE?: Vectorize;
 };
 
 const app = new Hono<{ Bindings: WorkerBindings }>();
@@ -47,6 +48,15 @@ type ThemeTimelineRow = {
 type AnalyzeTargetRow = {
 	id: string;
 	text: string;
+	source: FeedbackSource;
+	source_ref: string | null;
+	url: string | null;
+	account_tier: AccountTier | null;
+	product_area: ProductArea | null;
+	created_at: string;
+	sentiment: Sentiment | null;
+	urgency: Urgency | null;
+	embedding_id: string | null;
 	metadata_json: string | null;
 };
 
@@ -54,10 +64,49 @@ type AnalyzeRequest = {
 	scope?: "unprocessed";
 	steps?: {
 		classify?: boolean;
+		embed?: boolean;
 	};
 	limits?: {
 		max_items?: number;
 	};
+};
+
+type SearchResultRow = {
+	id: string;
+	source: FeedbackSource;
+	source_ref: string | null;
+	url: string | null;
+	author: string | null;
+	account_tier: AccountTier | null;
+	product_area: ProductArea | null;
+	created_at: string;
+	location_region: Region | null;
+	location_country: string | null;
+	location_colo: string | null;
+	text: string;
+	sentiment: Sentiment | null;
+	urgency: Urgency | null;
+	processed_at: string | null;
+	metadata_json: string | null;
+};
+
+type SearchAnswer = {
+	summary: string;
+	citations: string[];
+};
+
+type SearchResultItem = FeedbackItem & {
+	score: number | null;
+};
+
+type SearchAnswerPayload = {
+	summary: string;
+	citations: string[];
+};
+
+type EmbeddingResponse = {
+	shape: number[];
+	data: number[][];
 };
 
 type ThemeFamily =
@@ -190,7 +239,8 @@ function validateModelClassification(
 	};
 }
 
-function parseAiJsonResponse(payload: AiTextGenerationOutput): unknown {
+function parseAiJsonResponse(payload: unknown): unknown {
+	if (!isRecord(payload)) return payload;
 	const raw = payload.response;
 	if (typeof raw !== "string") return raw;
 	try {
@@ -198,6 +248,152 @@ function parseAiJsonResponse(payload: AiTextGenerationOutput): unknown {
 	} catch {
 		return raw;
 	}
+}
+
+async function runTextModel(
+	env: WorkerBindings,
+	model: string,
+	input: AiTextGenerationInput,
+): Promise<AiTextGenerationOutput> {
+	return (await env.AI.run(model as keyof AiModels, input as never)) as AiTextGenerationOutput;
+}
+
+function readMetadataString(
+	metadata: Record<string, unknown>,
+	key: string,
+): string | undefined {
+	const value = metadata[key];
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function compactText(value: string): string {
+	return value.replace(/\s+/g, " ").trim();
+}
+
+function buildEmbeddingText(input: {
+	text: string;
+	product_area?: ProductArea | null;
+	source?: FeedbackSource | null;
+	account_tier?: AccountTier | null;
+	sentiment?: Sentiment | null;
+	urgency?: Urgency | null;
+	metadata: Record<string, unknown>;
+}): string {
+	const themeFamily = readMetadataString(input.metadata, "theme_family");
+	const themeLabel = readMetadataString(input.metadata, "theme_label");
+
+	return [
+		`Feedback: ${compactText(input.text)}`,
+		input.product_area ? `Product area: ${input.product_area}` : null,
+		input.source ? `Source: ${input.source}` : null,
+		input.account_tier ? `Account tier: ${input.account_tier}` : null,
+		input.sentiment ? `Sentiment: ${input.sentiment}` : null,
+		input.urgency ? `Urgency: ${input.urgency}` : null,
+		themeFamily ? `Theme family: ${themeFamily}` : null,
+		themeLabel ? `Theme label: ${themeLabel}` : null,
+	]
+		.filter((value): value is string => Boolean(value))
+		.join("\n");
+}
+
+async function embedTexts(
+	env: WorkerBindings,
+	texts: string[],
+): Promise<number[][]> {
+	const response = (await env.AI.run(EMBEDDING_MODEL as keyof AiModels, {
+		text: texts,
+	} as never)) as EmbeddingResponse;
+
+	if (!response || !Array.isArray(response.data)) {
+		throw new Error("Embedding model returned an invalid response.");
+	}
+
+	return response.data;
+}
+
+function buildSearchAnswerPrompt(
+	query: string,
+	results: Array<{ id: string; text: string; source: FeedbackSource }>,
+): string {
+	return [
+		`User query: ${query}`,
+		"",
+		"Search results:",
+		...results.map(
+			(result, index) =>
+				`${index + 1}. [${result.id}] (${result.source}) ${compactText(result.text)}`,
+		),
+		"",
+		"Summarize the shared issue pattern and cite only ids from the provided results.",
+	].join("\n");
+}
+
+function validateSearchAnswer(
+	value: unknown,
+	allowedIds: Set<string>,
+): SearchAnswer | null {
+	if (!isRecord(value)) return null;
+	const summary = value.summary;
+	const citations = value.citations;
+	if (typeof summary !== "string" || !summary.trim()) return null;
+	if (!Array.isArray(citations)) return null;
+
+	const cleanedCitations = citations
+		.filter((citation): citation is string => typeof citation === "string")
+		.filter((citation) => allowedIds.has(citation))
+		.slice(0, 5);
+
+	return {
+		summary: summary.trim(),
+		citations: cleanedCitations,
+	};
+}
+
+async function generateSearchAnswer(
+	env: WorkerBindings,
+	query: string,
+	results: Array<{ id: string; text: string; source: FeedbackSource }>,
+): Promise<SearchAnswer | null> {
+	if (results.length === 0) return null;
+
+	const response = await runTextModel(env, PRIMARY_MODEL, {
+		messages: [
+			{
+				role: "system",
+				content: [
+					"You summarize semantic search results for product feedback.",
+					"Return strict JSON with a concise summary and supporting citation ids.",
+					"Only cite ids that appear in the provided evidence.",
+				].join(" "),
+			},
+			{
+				role: "user",
+				content: buildSearchAnswerPrompt(query, results),
+			},
+		],
+		response_format: {
+			type: "json_schema",
+			json_schema: {
+				type: "object",
+				properties: {
+					summary: { type: "string" },
+					citations: {
+						type: "array",
+						items: { type: "string" },
+					},
+				},
+				required: ["summary", "citations"],
+				additionalProperties: false,
+			},
+		},
+		max_tokens: 220,
+		temperature: 0.2,
+	});
+
+	return validateSearchAnswer(
+		parseAiJsonResponse(response) as SearchAnswerPayload,
+		new Set(results.map((result) => result.id)),
+	);
 }
 
 function violatesUrgencyGuardrails(
@@ -223,7 +419,7 @@ async function runClassificationModel(
 	model: string,
 	text: string,
 ): Promise<ModelClassification> {
-	const response = await env.AI.run(model, {
+	const response = await runTextModel(env, model, {
 		messages: [
 			{
 				role: "system",
@@ -354,6 +550,8 @@ const REGIONS: ReadonlySet<Region> = new Set(["NA", "EU", "APAC", "LATAM"]);
 
 const PRIMARY_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 const VERIFIER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
+const VECTOR_NAMESPACE = "feedback";
 
 const SENTIMENTS: readonly Sentiment[] = ["positive", "neutral", "negative"];
 const URGENCY_LEVELS: readonly Urgency[] = ["low", "medium", "high"];
@@ -679,6 +877,7 @@ app.post("/api/analyze", async (c) => {
 	const request = (isRecord(body) ? body : {}) as AnalyzeRequest;
 	const scope = request.scope ?? "unprocessed";
 	const classify = request.steps?.classify ?? false;
+	const embed = request.steps?.embed ?? false;
 	const maxItems = parseIntParam(String(request.limits?.max_items ?? ""), {
 		fallback: 100,
 		min: 1,
@@ -688,17 +887,34 @@ app.post("/api/analyze", async (c) => {
 	if (scope !== "unprocessed") {
 		return jsonError("Only scope=unprocessed is supported right now.", 400);
 	}
-	if (!classify) {
-		return jsonError("This endpoint currently supports steps.classify=true only.", 400);
+	if (!classify && !embed) {
+		return jsonError("Specify at least one analyze step.", 400);
+	}
+	if (embed && !c.env.VECTORIZE) {
+		return jsonError(
+			"Vectorize is not configured for this Worker yet.",
+			503,
+			"vectorize_unavailable",
+		);
 	}
 
 	let targets: AnalyzeTargetRow[] = [];
 	try {
+		const pendingPredicates: string[] = [];
+		if (classify) {
+			pendingPredicates.push("sentiment IS NULL", "urgency IS NULL");
+		}
+		if (embed) {
+			pendingPredicates.push("embedding_id IS NULL");
+		}
+
 		const result = await c.env.DB.prepare(
 			[
-				"SELECT id, text, metadata_json",
+				"SELECT",
+				"id, text, source, source_ref, url, account_tier, product_area, created_at,",
+				"sentiment, urgency, embedding_id, metadata_json",
 				"FROM feedback_items",
-				"WHERE sentiment IS NULL OR urgency IS NULL",
+				`WHERE ${pendingPredicates.join(" OR ")}`,
 				"ORDER BY created_at DESC",
 				"LIMIT ?",
 			].join(" "),
@@ -712,25 +928,45 @@ app.post("/api/analyze", async (c) => {
 	}
 
 	if (targets.length === 0) {
-		return c.json({ processed: 0, classified: 0, verifier_used_count: 0 });
+		return c.json({
+			processed: 0,
+			classified: 0,
+			embedded: 0,
+			verifier_used_count: 0,
+		});
 	}
 
-	const updateStatement = c.env.DB.prepare(
+	const classifyStatement = c.env.DB.prepare(
 		[
 			"UPDATE feedback_items",
 			"SET sentiment = ?, urgency = ?, processed_at = ?, metadata_json = ?",
 			"WHERE id = ?",
 		].join(" "),
 	);
+	const embedStatement = c.env.DB.prepare(
+		"UPDATE feedback_items SET embedding_id = ? WHERE id = ?",
+	);
 
 	let classified = 0;
+	let embedded = 0;
 	let verifierUsedCount = 0;
 	const now = new Date().toISOString();
+	const latestMetadataById = new Map<string, Record<string, unknown>>();
+	const latestSentimentById = new Map<string, Sentiment | null>();
+	const latestUrgencyById = new Map<string, Urgency | null>();
 
 	for (const item of targets) {
+		const metadata = parseMetadataJson(item.metadata_json);
+		latestMetadataById.set(item.id, metadata);
+		latestSentimentById.set(item.id, item.sentiment);
+		latestUrgencyById.set(item.id, item.urgency);
+
+		if (!classify || (item.sentiment && item.urgency)) {
+			continue;
+		}
+
 		try {
 			const classification = await classifyWithVerifierFallback(c.env, item.text);
-			const metadata = parseMetadataJson(item.metadata_json);
 			const nextMetadata = {
 				...metadata,
 				theme_family: classification.theme_family,
@@ -741,7 +977,7 @@ app.post("/api/analyze", async (c) => {
 				rationale: classification.rationale,
 			};
 
-			await updateStatement
+			await classifyStatement
 				.bind(
 					classification.sentiment,
 					classification.urgency,
@@ -751,6 +987,9 @@ app.post("/api/analyze", async (c) => {
 				)
 				.run();
 
+			latestMetadataById.set(item.id, nextMetadata);
+			latestSentimentById.set(item.id, classification.sentiment);
+			latestUrgencyById.set(item.id, classification.urgency);
 			classified += 1;
 			if (classification.verifier_used) verifierUsedCount += 1;
 		} catch (error) {
@@ -758,9 +997,66 @@ app.post("/api/analyze", async (c) => {
 		}
 	}
 
+	if (embed && c.env.VECTORIZE) {
+		const embedTargets = targets.filter((item) => item.embedding_id == null);
+
+		for (let start = 0; start < embedTargets.length; start += 25) {
+			const chunk = embedTargets.slice(start, start + 25);
+			if (chunk.length === 0) continue;
+
+			try {
+				const vectors = (
+					await embedTexts(
+						c.env,
+						chunk.map((item) =>
+							buildEmbeddingText({
+								text: item.text,
+								product_area: item.product_area,
+								source: item.source,
+								account_tier: item.account_tier,
+								sentiment: latestSentimentById.get(item.id) ?? item.sentiment,
+								urgency: latestUrgencyById.get(item.id) ?? item.urgency,
+								metadata: latestMetadataById.get(item.id) ?? {},
+							}),
+						),
+					)
+				).map((values, index) => {
+					const item = chunk[index];
+					const metadata = latestMetadataById.get(item.id) ?? {};
+
+					return {
+						id: item.id,
+						namespace: VECTOR_NAMESPACE,
+						values,
+						metadata: {
+							id: item.id,
+							source: item.source,
+							product_area: item.product_area ?? "unknown",
+							account_tier: item.account_tier ?? "unknown",
+							created_at: item.created_at,
+							sentiment: latestSentimentById.get(item.id) ?? "unknown",
+							urgency: latestUrgencyById.get(item.id) ?? "unknown",
+							theme_family: readMetadataString(metadata, "theme_family") ?? "unknown",
+							theme_label: readMetadataString(metadata, "theme_label") ?? "unknown",
+						},
+					};
+				});
+
+				await c.env.VECTORIZE.upsert(vectors);
+				await Promise.all(
+					chunk.map((item) => embedStatement.bind(item.id, item.id).run()),
+				);
+				embedded += chunk.length;
+			} catch (error) {
+				console.error("embedding upsert failed:", error);
+			}
+		}
+	}
+
 	return c.json({
-		processed: classified,
+		processed: classified + embedded,
 		classified,
+		embedded,
 		verifier_used_count: verifierUsedCount,
 	});
 });
@@ -897,6 +1193,190 @@ app.post("/api/ingest", async (c) => {
 		console.error("ingest failed:", err);
 		return jsonError("Failed to ingest items.", 500, "internal_error");
 	}
+});
+
+app.get("/api/search", async (c) => {
+	const query = c.req.query("q")?.trim() ?? "";
+	const k = parseIntParam(c.req.query("k"), {
+		fallback: 8,
+		min: 1,
+		max: 10,
+	});
+	const source = c.req.query("source");
+	const productArea = c.req.query("product_area");
+	const accountTier = c.req.query("account_tier");
+	const from = c.req.query("from");
+	const to = c.req.query("to");
+
+	if (!query) {
+		return jsonError("Missing required query parameter: q", 400);
+	}
+	if (source && !FEEDBACK_SOURCES.has(source as FeedbackSource)) {
+		return jsonError("Invalid source filter.", 400);
+	}
+	if (productArea && !PRODUCT_AREAS.has(productArea as ProductArea)) {
+		return jsonError("Invalid product_area filter.", 400);
+	}
+	if (accountTier && !ACCOUNT_TIERS.has(accountTier as AccountTier)) {
+		return jsonError("Invalid account_tier filter.", 400);
+	}
+
+	const filterSql: string[] = [];
+	const filterBinds: unknown[] = [];
+	if (source) {
+		filterSql.push("source = ?");
+		filterBinds.push(source);
+	}
+	if (productArea) {
+		filterSql.push("product_area = ?");
+		filterBinds.push(productArea);
+	}
+	if (accountTier) {
+		filterSql.push("account_tier = ?");
+		filterBinds.push(accountTier);
+	}
+	if (from) {
+		filterSql.push("created_at >= ?");
+		filterBinds.push(from);
+	}
+	if (to) {
+		filterSql.push("created_at <= ?");
+		filterBinds.push(to);
+	}
+
+	const baseSelect = [
+		"SELECT",
+		"id, source, source_ref, url, author, account_tier, product_area,",
+		"created_at, location_region, location_country, location_colo,",
+		"text, sentiment, urgency, processed_at, metadata_json",
+		"FROM feedback_items",
+	];
+
+	let mode: "semantic" | "text_fallback" = "text_fallback";
+	let results: SearchResultItem[] = [];
+
+	if (c.env.VECTORIZE) {
+		try {
+			const queryEmbedding = await embedTexts(c.env, [query]);
+			const matches = await c.env.VECTORIZE.query(queryEmbedding[0], {
+				topK: Math.min(20, Math.max(k * 4, k)),
+				namespace: VECTOR_NAMESPACE,
+				returnMetadata: "all",
+			});
+			const ids = Array.from(new Set(matches.matches.map((match) => match.id)));
+
+			if (ids.length > 0) {
+				const sql = [
+					...baseSelect,
+					`WHERE id IN (${ids.map(() => "?").join(", ")})`,
+					filterSql.length ? `AND ${filterSql.join(" AND ")}` : "",
+				]
+					.filter(Boolean)
+					.join(" ");
+				const rows = await c.env.DB.prepare(sql)
+					.bind(...ids, ...filterBinds)
+					.all<SearchResultRow>();
+
+				const rowsById = new Map(
+					(rows.results ?? []).map((row) => [row.id, row] as const),
+				);
+				const semanticResults: SearchResultItem[] = [];
+				for (const match of matches.matches) {
+					const row = rowsById.get(match.id);
+					if (!row) continue;
+
+					semanticResults.push({
+						id: row.id,
+						source: row.source,
+						source_ref: row.source_ref ?? undefined,
+						url: row.url ?? undefined,
+						author: row.author ?? undefined,
+						account_tier: row.account_tier ?? undefined,
+						product_area: row.product_area ?? undefined,
+						created_at: row.created_at,
+						location_region: row.location_region ?? undefined,
+						location_country: row.location_country ?? undefined,
+						location_colo: row.location_colo ?? undefined,
+						text: row.text,
+						sentiment: row.sentiment ?? undefined,
+						urgency: row.urgency ?? undefined,
+						processed_at: row.processed_at ?? undefined,
+						metadata: parseMetadataJson(row.metadata_json),
+						score: match.score,
+					});
+				}
+				results = semanticResults.slice(0, k);
+				if (results.length > 0) {
+					mode = "semantic";
+				}
+			}
+		} catch (error) {
+			console.error("semantic search failed, falling back to text search:", error);
+		}
+	}
+
+	if (results.length === 0) {
+		try {
+			const sql = [
+				...baseSelect,
+				"WHERE text LIKE ?",
+				filterSql.length ? `AND ${filterSql.join(" AND ")}` : "",
+				"ORDER BY created_at DESC",
+				"LIMIT ?",
+			]
+				.filter(Boolean)
+				.join(" ");
+			const rows = await c.env.DB.prepare(sql)
+				.bind(`%${query}%`, ...filterBinds, k)
+				.all<SearchResultRow>();
+			results = (rows.results ?? []).map((row) => ({
+				id: row.id,
+				source: row.source,
+				source_ref: row.source_ref ?? undefined,
+				url: row.url ?? undefined,
+				author: row.author ?? undefined,
+				account_tier: row.account_tier ?? undefined,
+				product_area: row.product_area ?? undefined,
+				created_at: row.created_at,
+				location_region: row.location_region ?? undefined,
+				location_country: row.location_country ?? undefined,
+				location_colo: row.location_colo ?? undefined,
+				text: row.text,
+				sentiment: row.sentiment ?? undefined,
+				urgency: row.urgency ?? undefined,
+				processed_at: row.processed_at ?? undefined,
+				metadata: parseMetadataJson(row.metadata_json),
+				score: null,
+			}));
+		} catch (error) {
+			console.error("fallback search failed:", error);
+			return jsonError("Failed to search feedback.", 500, "internal_error");
+		}
+	}
+
+	let answer: SearchAnswer | null = null;
+	if (results.length > 0) {
+		try {
+			answer = await generateSearchAnswer(
+				c.env,
+				query,
+				results.slice(0, 5).map((result) => ({
+					id: result.id,
+					text: result.text,
+					source: result.source,
+				})),
+			);
+		} catch (error) {
+			console.error("search summary generation failed:", error);
+		}
+	}
+
+	return c.json({
+		query,
+		mode,
+		results,
+		answer,
+	});
 });
 
 app.get("/api/items", async (c) => {

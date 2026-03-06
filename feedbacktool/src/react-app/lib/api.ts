@@ -21,6 +21,7 @@ export type IngestResponse = {
 export type AnalyzeResponse = {
 	processed: number;
 	classified: number;
+	embedded?: number;
 	verifier_used_count: number;
 };
 
@@ -71,6 +72,20 @@ export type TrendsResponse = {
 	product_area_breakdown: BreakdownDatum[];
 	tier_breakdown: BreakdownDatum[];
 	theme_timeline: ThemeTimelinePoint[];
+};
+
+export type SearchResult = FeedbackItem & {
+	score: number | null;
+};
+
+export type SearchResponse = {
+	query: string;
+	mode: "semantic" | "text_fallback";
+	results: SearchResult[];
+	answer: {
+		summary: string;
+		citations: string[];
+	} | null;
 };
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -141,16 +156,35 @@ export async function ingestItems(items: FeedbackItem[]): Promise<IngestResponse
 	);
 }
 
-export async function analyzeItems(maxItems: number = 100): Promise<AnalyzeResponse> {
+export async function analyzeItems(
+	maxItems: number = 100,
+	steps: { classify?: boolean; embed?: boolean } = {
+		classify: true,
+		embed: true,
+	},
+): Promise<AnalyzeResponse> {
 	return readJson<AnalyzeResponse>(
 		await fetch("/api/analyze", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({
 				scope: "unprocessed",
-				steps: { classify: true },
+				steps,
 				limits: { max_items: maxItems },
 			}),
 		}),
 	);
+}
+
+export async function searchItems(params: {
+	q: string;
+	k?: number;
+	source?: string;
+	product_area?: string;
+	account_tier?: string;
+	from?: string;
+	to?: string;
+}): Promise<SearchResponse> {
+	const search = buildItemsSearch(params);
+	return readJson<SearchResponse>(await fetch(`/api/search?${search}`));
 }

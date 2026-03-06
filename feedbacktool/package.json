@@ -39,6 +39,8 @@
 		"cf-typegen": "wrangler types",
 		"check": "tsc && vite build && wrangler deploy --dry-run",
 		"db:create": "wrangler d1 create feedback-db --binding DB --update-config",
+		"vectorize:create": "wrangler vectorize create feedback-search-index --dimensions=768 --metric=cosine --binding VECTORIZE --update-config --use-remote",
+		"vectorize:info": "wrangler vectorize info feedback-search-index",
 		"ingest:all": "node ./scripts/ingest-mock-data.mjs --dataset all",
 		"ingest:seed": "node ./scripts/ingest-mock-data.mjs --dataset seed",
 		"ingest:stream": "node ./scripts/ingest-mock-data.mjs --dataset stream",

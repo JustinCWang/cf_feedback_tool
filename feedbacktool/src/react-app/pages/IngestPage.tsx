@@ -40,12 +40,13 @@ export function IngestPage() {
 		setAnalyzing(true);
 		setStatus("");
 		try {
-			const result = await analyzeItems(100);
+			const result = await analyzeItems(100, { classify: true, embed: true });
 			const latest = await getItems({ limit: 8, offset: 0 });
 			setPreview(latest.items);
 			setStatus(
 				[
 					`Analyzed ${result.classified} items.`,
+					`Indexed ${result.embedded ?? 0} vectors.`,
 					`Updated ${result.processed} rows.`,
 					`Verifier used ${result.verifier_used_count} times.`,
 				].join(" "),
@@ -80,7 +81,7 @@ export function IngestPage() {
 
 				<SectionCard
 					title="AI classification"
-					description="Run Workers AI sentiment, urgency, and theme labeling on the newest unprocessed feedback."
+					description="Run Workers AI classification plus Vectorize indexing on the newest unprocessed feedback."
 				>
 					<div className="action-stack">
 						<button type="button" onClick={handleAnalyze} disabled={busy || analyzing}>
@@ -88,8 +89,8 @@ export function IngestPage() {
 							<span>{analyzing ? "Analyzing feedback..." : "Analyze unprocessed items"}</span>
 						</button>
 						<p className="muted-text">
-							Uses JSON Mode with an 8B primary model and a stronger verifier when
-							confidence is low or guardrails are violated.
+							Uses JSON Mode for classification, then embeds the enriched feedback into
+							Vectorize for semantic search and related-issue lookup.
 						</p>
 					</div>
 				</SectionCard>
