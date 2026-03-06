@@ -28,6 +28,13 @@
 			"database_id": "54a0b4c7-558e-464a-81c2-6fbf561ae860",
 			"migrations_dir": "./migrations"
 		}
+	],
+	"vectorize": [
+		{
+			"binding": "VECTORIZE",
+			"index_name": "feedback-search-index",
+			"remote": true
+		}
 	]
 	/**
 	 * Smart Placement
