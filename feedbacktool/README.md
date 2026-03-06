@@ -1,90 +1,44 @@
-# React + Vite + Hono + Cloudflare Workers
+# Feedback Tool
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/vite-react-template)
+Cloudflare Worker + React app for loading and exploring mock customer feedback in D1.
 
-This template provides a minimal setup for building a React application with TypeScript and Vite, designed to run on Cloudflare Workers. It features hot module replacement, ESLint integration, and the flexibility of Workers deployments.
+## Commands
 
-![React + TypeScript + Vite + Cloudflare Workers](https://imagedelivery.net/wSMYJvS3Xw-n339CbDyDIA/fc7b4b62-442b-4769-641b-ad4422d74300/public)
-
-<!-- dash-content-start -->
-
-🚀 Supercharge your web development with this powerful stack:
-
-- [**React**](https://react.dev/) - A modern UI library for building interactive interfaces
-- [**Vite**](https://vite.dev/) - Lightning-fast build tooling and development server
-- [**Hono**](https://hono.dev/) - Ultralight, modern backend framework
-- [**Cloudflare Workers**](https://developers.cloudflare.com/workers/) - Edge computing platform for global deployment
-
-### ✨ Key Features
-
-- 🔥 Hot Module Replacement (HMR) for rapid development
-- 📦 TypeScript support out of the box
-- 🛠️ ESLint configuration included
-- ⚡ Zero-config deployment to Cloudflare's global network
-- 🎯 API routes with Hono's elegant routing
-- 🔄 Full-stack development setup
-- 🔎 Built-in Observability to monitor your Worker
-
-Get started in minutes with local development or deploy directly via the Cloudflare dashboard. Perfect for building modern, performant web applications at the edge.
-
-<!-- dash-content-end -->
-
-## Getting Started
-
-To start a new project with this template, run:
-
-```bash
-npm create cloudflare@latest -- --template=cloudflare/templates/vite-react-template
-```
-
-A live deployment of this template is available at:
-[https://react-vite-template.templates.workers.dev](https://react-vite-template.templates.workers.dev)
-
-## Development
-
-Install dependencies:
-
-```bash
+```sh
 npm install
-```
-
-Start the development server with:
-
-```bash
+npm run db:migrate:local
 npm run dev
 ```
 
-Your application will be available at [http://localhost:5173](http://localhost:5173).
+For remote Cloudflare D1:
 
-## Production
-
-Build your project for production:
-
-```bash
-npm run build
+```sh
+npm run db:migrate:remote
+npm run deploy
 ```
 
-Preview your build locally:
+## Mock datasets
 
-```bash
-npm run preview
+The app ships with three staged datasets in `public/data/`:
+
+- `seed.json`: baseline multi-product feedback
+- `stream.json`: a recent spike across WAF, Zero Trust, and Analytics
+- `followup.json`: escalation and recovery signals that extend the story
+
+Use the UI buttons to ingest each dataset, or ingest everything at once from the CLI:
+
+```sh
+npm run ingest:all
 ```
 
-Deploy your project to Cloudflare Workers:
+To ingest into the deployed Worker so records land in remote D1:
 
-```bash
-npm run build && npm run deploy
+```sh
+node ./scripts/ingest-mock-data.mjs --dataset all --url https://<your-worker>.workers.dev
 ```
 
-Monitor your workers:
+## API
 
-```bash
-npx wrangler tail
-```
-
-## Additional Resources
-
-- [Cloudflare Workers Documentation](https://developers.cloudflare.com/workers/)
-- [Vite Documentation](https://vitejs.dev/guide/)
-- [React Documentation](https://reactjs.org/)
-- [Hono Documentation](https://hono.dev/)
+- `GET /api/health`
+- `POST /api/ingest`
+- `GET /api/items`
